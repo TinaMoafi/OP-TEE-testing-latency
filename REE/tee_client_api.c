@@ -60,38 +60,6 @@ struct legacy_operation {
 #define TITANSSL_ZC_THRESHOLD 1
 #endif
 
-/*
- * Maximum data exposed to the TA in one invocation.
- *
- * SHA:
- *   6.5 MiB was observed working, 7 MiB failed.
- *   Use 6 MiB.
- *
- * AES:
- *   AES has both input and output memrefs.
- *   Start conservatively at 3 MiB and validate correctness/performance.
- */
-#ifndef TITANSSL_SHA_MAX_INVOKE
-#define TITANSSL_SHA_MAX_INVOKE (6U * 1024U * 1024U)
-#endif
-
-#ifndef TITANSSL_AES_MAX_INVOKE
-#define TITANSSL_AES_MAX_INVOKE (3U * 1024U * 1024U)
-#endif
-
-/*
- * Maximum SHA input presented to the TA in one invocation.
- *
- * Measured platform behaviour:
- *   6.5 MiB succeeds
- *   7.0 MiB fails with TEE_ERROR_OUT_OF_MEMORY
- *
- * Use 6 MiB to keep a safety margin.
- */
-#ifndef TITANSSL_SHA_MAX_INVOKE
-#define TITANSSL_SHA_MAX_INVOKE (6U * 1024U * 1024U)
-#endif
-
 static inline bool use_zerocopy(size_t n) {
     return n >= TITANSSL_ZC_THRESHOLD;
 }
@@ -157,7 +125,7 @@ static TEEC_Result ensure_pg_shm_multi(
     uintptr_t p = (uintptr_t)ptr;
 
     // Align pointer down to the start of its memory page
-    // Example: ptr=0x88d1c8 → base_u=0x88d000
+    // Example: ptr=0x88d1c8 â†’ base_u=0x88d000
     uintptr_t base_u = align_down_u(p, ps);
 
     // Calculate offset of ptr inside the page
@@ -185,7 +153,7 @@ static TEEC_Result ensure_pg_shm_multi(
             cache[i].base == (void*)base_u &&
             cache[i].cap >= cap) {
 
-            // Page already registered → no new register needed
+            // Page already registered â†’ no new register needed
             return TEEC_SUCCESS;
         }
     }
@@ -212,7 +180,7 @@ static TEEC_Result ensure_pg_shm_multi(
     // STEP 3: Release old shared memory if needed
     // ------------------------------------------------------------
     if (cache[v].valid) {
-        // This page was previously registered → release it
+        // This page was previously registered â†’ release it
         DBG_PRINT("AES ensure_pg_shm: releasing old SHM base=%p cap=%zu",
                   cache[v].base, cache[v].cap);
 
@@ -481,194 +449,69 @@ TEEC_Result TitanSSL_TEEC_InvokeCommand(TEEC_Session *session,
     TEEC_Operation op2; memset(&op2, 0, sizeof(op2));
 
     if (commandID == TITANSSL_CMD_SHA256_UPDATE) {
-
         if (!p->input_address || p->input_size == 0) {
-            if (returnOrigin)
-                *returnOrigin = TEEC_ORIGIN_API;
+            if (returnOrigin) *returnOrigin = TEEC_ORIGIN_API;
             return TEEC_ERROR_BAD_PARAMETERS;
         }
 
-        uint8_t *in = (uint8_t *)(uintptr_t)p->input_address;
-        size_t len  = (size_t)p->input_size;
+        void  *in  = (void *)(uintptr_t)p->input_address;
+        size_t len = (size_t)p->input_size;
 
-        const size_t max_chunk =
-            (size_t)TITANSSL_SHA_MAX_INVOKE;
-
-        /*
-         * ========================================================
-         * SHA ZC
-         * ========================================================
-         *
-         * Register only one bounded window at a time.
-         *
-         * The page-aligned base allows PARTIAL_INPUT to point at
-         * the exact OpenSSL data without copying it.
-         */
         if (use_zerocopy(len)) {
+            /* Reuse cached registration if pointer matches and capacity is enough */
+            bool reuse = sha_in_zc.valid && sha_in_zc.ptr == in && sha_in_zc.size >= len;
 
-            size_t offset = 0;
-            size_t ps = titan_pagesz();
-
-            while (offset < len) {
-
-                size_t chunk = len - offset;
-
-                if (chunk > max_chunk)
-                    chunk = max_chunk;
-
-                uint8_t *chunk_ptr = in + offset;
-
-                uintptr_t ptr_u =
-                    (uintptr_t)chunk_ptr;
-
-                uintptr_t base_u =
-                    align_down_u(ptr_u, ps);
-
-                size_t shm_off =
-                    (size_t)(ptr_u - base_u);
-
-                /*
-                 * Start is page aligned.
-                 * Do not round the end beyond our actual buffer.
-                 */
-                size_t shm_len =
-                    shm_off + chunk;
-
-                TEEC_SharedMemory shm;
-                memset(&shm, 0, sizeof(shm));
-
-                shm.buffer = (void *)base_u;
-                shm.size   = shm_len;
-                shm.flags  = TEEC_MEM_INPUT;
-
-                r = TEEC_RegisterSharedMemory(
-                        &real_ctx,
-                        &shm);
-
+            if (!reuse) {
+                if (sha_in_zc.valid) {
+                    TEEC_ReleaseSharedMemory(&sha_in_zc.shm);
+                    sha_rel_calls++;
+                    sha_in_zc.valid = false;
+                }
+                sha_in_zc.shm.buffer = in;
+                sha_in_zc.shm.size   = len;
+                sha_in_zc.shm.flags  = TEEC_MEM_INPUT;
+                r = TEEC_RegisterSharedMemory(&real_ctx, &sha_in_zc.shm);
                 sha_reg_calls++;
-
-                DBG_PRINT(
-                    "SHA UPDATE ZC WINDOW REG: "
-                    "off=%zu data=%zu shm_off=%zu shm_len=%zu -> 0x%x",
-                    offset,
-                    chunk,
-                    shm_off,
-                    shm_len,
-                    r);
-
-                if (r != TEEC_SUCCESS) {
-                    if (returnOrigin)
-                        *returnOrigin = TEEC_ORIGIN_API;
+                DBG_PRINT("SHA UPDATE ZC: Reg IN ptr=%p len=%zu -> 0x%x", in, len, r);
+                if (r == TEEC_SUCCESS) {
+                    sha_in_zc.ptr   = in;
+                    sha_in_zc.size  = len;
+                    sha_in_zc.valid = true;
+                } else {
+                    /* Fallback to TEMP path */
+                    op2.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
+                    op2.params[0].tmpref.buffer = in;
+                    op2.params[0].tmpref.size   = len;
+                    r = TEEC_InvokeCommand(target, commandID, &op2, &origin);
+                    DBG_PRINT("SHA UPDATE TMP-FALLBACK: 0x%x (origin=%u)", r, origin);
+                    sha_tmp_updates++;
+                    if (returnOrigin) *returnOrigin = origin;
                     return r;
                 }
-
-                memset(&op2, 0, sizeof(op2));
-
-                op2.paramTypes =
-                    TEEC_PARAM_TYPES(
-                        TEEC_MEMREF_PARTIAL_INPUT,
-                        TEEC_NONE,
-                        TEEC_NONE,
-                        TEEC_NONE);
-
-                op2.params[0].memref.parent = &shm;
-                op2.params[0].memref.offset = shm_off;
-                op2.params[0].memref.size   = chunk;
-
-                r = TEEC_InvokeCommand(
-                        target,
-                        commandID,
-                        &op2,
-                        &origin);
-
-                DBG_PRINT(
-                    "SHA UPDATE ZC WINDOW INVOKE: "
-                    "off=%zu len=%zu/%zu -> 0x%x (origin=%u)",
-                    offset,
-                    chunk,
-                    len,
-                    r,
-                    origin);
-
-                sha_zc_updates++;
-
-                TEEC_ReleaseSharedMemory(&shm);
-                sha_rel_calls++;
-
-                if (r != TEEC_SUCCESS) {
-                    if (returnOrigin)
-                        *returnOrigin = origin;
-                    return r;
-                }
-
-                offset += chunk;
+            } else {
+                DBG_PRINT("SHA UPDATE ZC: reuse IN cache ptr=%p cap=%zu len=%zu", sha_in_zc.ptr, sha_in_zc.size, len);
             }
 
-            if (returnOrigin)
-                *returnOrigin = origin;
+            op2.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
+            op2.params[0].memref.parent = &sha_in_zc.shm;
+            op2.params[0].memref.offset = 0;
+            op2.params[0].memref.size   = len;
 
-            return TEEC_SUCCESS;
-        }
-
-        /*
-         * ========================================================
-         * SHA TEMP / ZX
-         * ========================================================
-         */
-        size_t offset = 0;
-
-        while (offset < len) {
-
-            size_t chunk = len - offset;
-
-            if (chunk > max_chunk)
-                chunk = max_chunk;
-
-            memset(&op2, 0, sizeof(op2));
-
-            op2.paramTypes =
-                TEEC_PARAM_TYPES(
-                    TEEC_MEMREF_TEMP_INPUT,
-                    TEEC_NONE,
-                    TEEC_NONE,
-                    TEEC_NONE);
-
-            op2.params[0].tmpref.buffer =
-                in + offset;
-
-            op2.params[0].tmpref.size =
-                chunk;
-
-            r = TEEC_InvokeCommand(
-                    target,
-                    commandID,
-                    &op2,
-                    &origin);
-
-            DBG_PRINT(
-                "SHA UPDATE TMP CHUNK: "
-                "off=%zu len=%zu/%zu -> 0x%x (origin=%u)",
-                offset,
-                chunk,
-                len,
-                r,
-                origin);
-
+            r = TEEC_InvokeCommand(target, commandID, &op2, &origin);
+            DBG_PRINT("SHA UPDATE ZC: Invoke -> 0x%x (origin=%u)", r, origin);
+            sha_zc_updates++;
+        } else {
+            /* Small copy path */
+            op2.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
+            op2.params[0].tmpref.buffer = in;
+            op2.params[0].tmpref.size   = len;
+            r = TEEC_InvokeCommand(target, commandID, &op2, &origin);
+            DBG_PRINT("SHA UPDATE TMP: Invoke -> 0x%x (origin=%u)", r, origin);
             sha_tmp_updates++;
-
-            if (r != TEEC_SUCCESS) {
-                if (returnOrigin)
-                    *returnOrigin = origin;
-                return r;
-            }
-
-            offset += chunk;
         }
 
-        if (returnOrigin)
-            *returnOrigin = origin;
-
-        return TEEC_SUCCESS;
+        if (returnOrigin) *returnOrigin = origin;
+        return r;
     }
 
     if (commandID == TITANSSL_CMD_SHA256_FINAL) {
@@ -785,9 +628,6 @@ if (commandID == TITANSSL_CMD_AES_INIT) {
 
     TEEC_Result rr = TEEC_RegisterSharedMemory(&real_ctx, &meta_shm);
 
-    DBG_PRINT("AES INIT META REG: ptr=%p size=%zu -> 0x%x",
-              meta_ptr, meta_sz, rr);
-
     if (rr != TEEC_SUCCESS) {
         /* TEMP fallback */
         titanssl_meta_aes_t meta_copy;
@@ -802,10 +642,6 @@ if (commandID == TITANSSL_CMD_AES_INIT) {
 
         uint32_t origin = 0;
         TEEC_Result r = TEEC_InvokeCommand(target, commandID, &op2i, &origin);
-
-        DBG_PRINT("AES INIT TEMP INVOKE: result=0x%x origin=%u",
-                  r, origin);
-
         if (returnOrigin) *returnOrigin = origin;
         return r;
     }
@@ -822,9 +658,6 @@ if (commandID == TITANSSL_CMD_AES_INIT) {
     uint32_t origin = 0;
     TEEC_Result r = TEEC_InvokeCommand(target, commandID, &op2i, &origin);
 
-    DBG_PRINT("AES INIT ZC INVOKE: result=0x%x origin=%u",
-              r, origin);
-
     TEEC_ReleaseSharedMemory(&meta_shm);
 
     if (returnOrigin) *returnOrigin = origin;
@@ -832,641 +665,145 @@ if (commandID == TITANSSL_CMD_AES_INIT) {
 }
 
     if (commandID == TITANSSL_CMD_AES_DOCIPHER) {
+    void   *in_buf  = NULL;
+    size_t  in_len  = 0;
+    void   *out_buf = NULL;
+    size_t  out_len = 0;
 
-        uint8_t *in_buf  = NULL;
-        size_t   in_len  = 0;
-        uint8_t *out_buf = NULL;
-        size_t   out_len = 0;
-
-        /*
-         * Resolve buffers from TitanSSL control block first.
-         */
-        if (p->input_address &&
-            p->input_size &&
-            p->output_address) {
-
-            in_buf =
-                (uint8_t *)(uintptr_t)p->input_address;
-
-            in_len =
-                (size_t)p->input_size;
-
-            out_buf =
-                (uint8_t *)(uintptr_t)p->output_address;
-
-            out_len =
-                (size_t)(p->output_size ?
-                         p->output_size :
-                         p->input_size);
-
-            DBG_PRINT(
-                "AES DOCIPHER (CB): "
-                "in=%p len=%zu out=%p out_len=%zu",
-                in_buf, in_len,
-                out_buf, out_len);
-
-        } else {
-
-            /*
-             * Direct OpenSSL tmpref path.
-             */
-            uint32_t t0 =
-                TEEC_PARAM_TYPE_GET(lop->paramTypes, 0);
-
-            uint32_t t1 =
-                TEEC_PARAM_TYPE_GET(lop->paramTypes, 1);
-
-            if (t0 == TEEC_MEMREF_TEMP_INPUT &&
-                t1 == TEEC_MEMREF_TEMP_OUTPUT &&
-                lop->params[0].tmpref.buffer &&
-                lop->params[1].tmpref.buffer &&
-                lop->params[0].tmpref.size > 0) {
-
-                in_buf =
-                    (uint8_t *)lop->params[0].tmpref.buffer;
-
-                in_len =
-                    lop->params[0].tmpref.size;
-
-                out_buf =
-                    (uint8_t *)lop->params[1].tmpref.buffer;
-
-                out_len =
-                    lop->params[1].tmpref.size;
-
-                DBG_PRINT(
-                    "AES DOCIPHER (DIRECT): "
-                    "in=%p len=%zu out=%p out_len=%zu",
-                    in_buf, in_len,
-                    out_buf, out_len);
-            }
+    /* Use control-block if provided; else fall back to DIRECT tmprefs */
+    if (p->input_address && p->input_size && p->output_address) {
+        in_buf  = (void *)(uintptr_t)p->input_address;
+        in_len  = (size_t)p->input_size;
+        out_buf = (void *)(uintptr_t)p->output_address;
+        out_len = (size_t)(p->output_size ? p->output_size : p->input_size);
+        DBG_PRINT("AES DOCIPHER (CB): in=%p len=%zu out=%p out_len=%zu", in_buf, in_len, out_buf, out_len);
+    } else {
+        uint32_t t0 = TEEC_PARAM_TYPE_GET(lop->paramTypes, 0);
+        uint32_t t1 = TEEC_PARAM_TYPE_GET(lop->paramTypes, 1);
+        if (t0 == TEEC_MEMREF_TEMP_INPUT && t1 == TEEC_MEMREF_TEMP_OUTPUT &&
+            lop->params[0].tmpref.buffer && lop->params[1].tmpref.buffer &&
+            lop->params[0].tmpref.size > 0) {
+            in_buf  = lop->params[0].tmpref.buffer;
+            in_len  = lop->params[0].tmpref.size;
+            out_buf = lop->params[1].tmpref.buffer;
+            out_len = lop->params[1].tmpref.size;
+            DBG_PRINT("AES DOCIPHER (DIRECT): in=%p len=%zu out=%p out_len=%zu", in_buf, in_len, out_buf, out_len);
         }
-
-        if (!in_buf ||
-            !out_buf ||
-            in_len == 0) {
-
-            if (returnOrigin)
-                *returnOrigin = TEEC_ORIGIN_API;
-
-            return TEEC_ERROR_BAD_PARAMETERS;
-        }
-
-        /*
-         * AES-CBC NOPAD requires complete 16-byte blocks.
-         */
-        if ((in_len & 0x0F) != 0 ||
-            out_len < in_len) {
-
-            DBG_PRINT(
-                "AES DOCIPHER: bad lengths "
-                "in=%zu out=%zu",
-                in_len,
-                out_len);
-
-            if (returnOrigin)
-                *returnOrigin = TEEC_ORIGIN_API;
-
-            return TEEC_ERROR_BAD_PARAMETERS;
-        }
-
-        const size_t max_chunk =
-            (size_t)TITANSSL_AES_MAX_INVOKE;
-
-        if (max_chunk == 0 ||
-            (max_chunk & 0x0F) != 0) {
-
-            if (returnOrigin)
-                *returnOrigin = TEEC_ORIGIN_API;
-
-            return TEEC_ERROR_BAD_PARAMETERS;
-        }
-
-        /*
-         * ========================================================
-         * ZERO-COPY
-         * ========================================================
-         */
-        if (use_zerocopy(in_len)) {
-
-            /*
-             * ----------------------------------------------------
-             * SMALL / STREAMING ZC
-             * ----------------------------------------------------
-             *
-             * For normal OpenSSL streaming calls (for example
-             * repeated 4 KiB buffers), keep the page registrations
-             * cached and reuse them.
-             *
-             * This is the important optimization for openssl enc.
-             */
-            if (in_len <= max_chunk &&
-                in_buf != out_buf) {
-
-                size_t in_off  = 0;
-                size_t out_off = 0;
-
-                r = ensure_pg_shm_multi(
-                        &real_ctx,
-                        aes_in_pg,
-                        AES_PG_CACHE_N,
-                        &aes_in_rr,
-                        in_buf,
-                        in_len,
-                        TEEC_MEM_INPUT,
-                        &in_off);
-
-                if (r != TEEC_SUCCESS) {
-                    if (returnOrigin)
-                        *returnOrigin = TEEC_ORIGIN_API;
-
-                    return r;
-                }
-
-                r = ensure_pg_shm_multi(
-                        &real_ctx,
-                        aes_out_pg,
-                        AES_PG_CACHE_N,
-                        &aes_out_rr,
-                        out_buf,
-                        in_len,
-                        TEEC_MEM_OUTPUT,
-                        &out_off);
-
-                if (r != TEEC_SUCCESS) {
-                    if (returnOrigin)
-                        *returnOrigin = TEEC_ORIGIN_API;
-
-                    return r;
-                }
-
-                uintptr_t in_base =
-                    align_down_u(
-                        (uintptr_t)in_buf,
-                        titan_pagesz());
-
-                uintptr_t out_base =
-                    align_down_u(
-                        (uintptr_t)out_buf,
-                        titan_pagesz());
-
-                TEEC_SharedMemory *in_parent  = NULL;
-                TEEC_SharedMemory *out_parent = NULL;
-
-                for (unsigned i = 0;
-                     i < AES_PG_CACHE_N;
-                     i++) {
-
-                    if (aes_in_pg[i].valid &&
-                        aes_in_pg[i].base ==
-                            (void *)in_base) {
-
-                        in_parent =
-                            &aes_in_pg[i].shm;
-                    }
-
-                    if (aes_out_pg[i].valid &&
-                        aes_out_pg[i].base ==
-                            (void *)out_base) {
-
-                        out_parent =
-                            &aes_out_pg[i].shm;
-                    }
-                }
-
-                if (!in_parent ||
-                    !out_parent) {
-
-                    if (returnOrigin)
-                        *returnOrigin =
-                            TEEC_ORIGIN_API;
-
-                    return TEEC_ERROR_BAD_STATE;
-                }
-
-                memset(&op2, 0, sizeof(op2));
-
-                op2.paramTypes =
-                    TEEC_PARAM_TYPES(
-                        TEEC_MEMREF_PARTIAL_INPUT,
-                        TEEC_MEMREF_PARTIAL_OUTPUT,
-                        TEEC_NONE,
-                        TEEC_NONE);
-
-                op2.params[0].memref.parent =
-                    in_parent;
-
-                op2.params[0].memref.offset =
-                    in_off;
-
-                op2.params[0].memref.size =
-                    in_len;
-
-                op2.params[1].memref.parent =
-                    out_parent;
-
-                op2.params[1].memref.offset =
-                    out_off;
-
-                op2.params[1].memref.size =
-                    in_len;
-
-                r = TEEC_InvokeCommand(
-                        target,
-                        commandID,
-                        &op2,
-                        &origin);
-
-                DBG_PRINT(
-                    "AES ZC CACHE INVOKE: "
-                    "in=%p off=%zu "
-                    "out=%p off=%zu "
-                    "len=%zu -> 0x%x "
-                    "(origin=%u)",
-                    in_buf,
-                    in_off,
-                    out_buf,
-                    out_off,
-                    in_len,
-                    r,
-                    origin);
-
-                aes_zc_calls_in++;
-                aes_zc_calls_out++;
-
-                if (r == TEEC_SUCCESS)
-                    p->output_size =
-                        (unsigned long)in_len;
-
-                if (returnOrigin)
-                    *returnOrigin = origin;
-
-                return r;
-            }
-
-            /*
-             * ----------------------------------------------------
-             * LARGE or IN-PLACE ZC
-             * ----------------------------------------------------
-             *
-             * Large buffers cannot be registered as one giant SHM
-             * object, so use bounded windows.
-             *
-             * In-place OpenSSL speed also uses this path because a
-             * single INPUT|OUTPUT registration is safest there.
-             */
-            size_t offset = 0;
-            size_t ps = titan_pagesz();
-
-            while (offset < in_len) {
-
-                size_t chunk =
-                    in_len - offset;
-
-                if (chunk > max_chunk)
-                    chunk = max_chunk;
-
-                uint8_t *in_ptr =
-                    in_buf + offset;
-
-                uint8_t *out_ptr =
-                    out_buf + offset;
-
-                bool inplace =
-                    (in_ptr == out_ptr);
-
-                memset(&op2, 0, sizeof(op2));
-
-                if (inplace) {
-
-                    uintptr_t p_u =
-                        (uintptr_t)in_ptr;
-
-                    uintptr_t base_u =
-                        align_down_u(p_u, ps);
-
-                    size_t shm_off =
-                        (size_t)(p_u - base_u);
-
-                    size_t shm_len =
-                        shm_off + chunk;
-
-                    TEEC_SharedMemory shm;
-                    memset(&shm, 0, sizeof(shm));
-
-                    shm.buffer =
-                        (void *)base_u;
-
-                    shm.size =
-                        shm_len;
-
-                    shm.flags =
-                        TEEC_MEM_INPUT |
-                        TEEC_MEM_OUTPUT;
-
-                    r = TEEC_RegisterSharedMemory(
-                            &real_ctx,
-                            &shm);
-
-                    aes_reg_calls++;
-
-                    DBG_PRINT(
-                        "AES ZC INPLACE REG: "
-                        "off=%zu data=%zu "
-                        "shm_off=%zu "
-                        "shm_len=%zu -> 0x%x",
-                        offset,
-                        chunk,
-                        shm_off,
-                        shm_len,
-                        r);
-
-                    if (r != TEEC_SUCCESS) {
-                        if (returnOrigin)
-                            *returnOrigin =
-                                TEEC_ORIGIN_API;
-
-                        return r;
-                    }
-
-                    op2.paramTypes =
-                        TEEC_PARAM_TYPES(
-                            TEEC_MEMREF_PARTIAL_INPUT,
-                            TEEC_MEMREF_PARTIAL_OUTPUT,
-                            TEEC_NONE,
-                            TEEC_NONE);
-
-                    op2.params[0].memref.parent =
-                        &shm;
-
-                    op2.params[0].memref.offset =
-                        shm_off;
-
-                    op2.params[0].memref.size =
-                        chunk;
-
-                    op2.params[1].memref.parent =
-                        &shm;
-
-                    op2.params[1].memref.offset =
-                        shm_off;
-
-                    op2.params[1].memref.size =
-                        chunk;
-
-                    r = TEEC_InvokeCommand(
-                            target,
-                            commandID,
-                            &op2,
-                            &origin);
-
-                    DBG_PRINT(
-                        "AES ZC INPLACE INVOKE: "
-                        "off=%zu len=%zu/%zu "
-                        "-> 0x%x (origin=%u)",
-                        offset,
-                        chunk,
-                        in_len,
-                        r,
-                        origin);
-
-                    aes_zc_calls_in++;
-                    aes_zc_calls_out++;
-
-                    TEEC_ReleaseSharedMemory(&shm);
-                    aes_rel_calls++;
-
-                } else {
-
-                    uintptr_t in_u =
-                        (uintptr_t)in_ptr;
-
-                    uintptr_t out_u =
-                        (uintptr_t)out_ptr;
-
-                    uintptr_t in_base_u =
-                        align_down_u(in_u, ps);
-
-                    uintptr_t out_base_u =
-                        align_down_u(out_u, ps);
-
-                    size_t in_off =
-                        (size_t)(in_u -
-                                 in_base_u);
-
-                    size_t out_off =
-                        (size_t)(out_u -
-                                 out_base_u);
-
-                    TEEC_SharedMemory in_shm;
-                    TEEC_SharedMemory out_shm;
-
-                    memset(&in_shm, 0,
-                           sizeof(in_shm));
-
-                    memset(&out_shm, 0,
-                           sizeof(out_shm));
-
-                    in_shm.buffer =
-                        (void *)in_base_u;
-
-                    in_shm.size =
-                        in_off + chunk;
-
-                    in_shm.flags =
-                        TEEC_MEM_INPUT;
-
-                    out_shm.buffer =
-                        (void *)out_base_u;
-
-                    out_shm.size =
-                        out_off + chunk;
-
-                    out_shm.flags =
-                        TEEC_MEM_OUTPUT;
-
-                    r = TEEC_RegisterSharedMemory(
-                            &real_ctx,
-                            &in_shm);
-
-                    aes_reg_calls++;
-
-                    if (r != TEEC_SUCCESS) {
-                        if (returnOrigin)
-                            *returnOrigin =
-                                TEEC_ORIGIN_API;
-
-                        return r;
-                    }
-
-                    TEEC_Result rr =
-                        TEEC_RegisterSharedMemory(
-                            &real_ctx,
-                            &out_shm);
-
-                    aes_reg_calls++;
-
-                    if (rr != TEEC_SUCCESS) {
-
-                        TEEC_ReleaseSharedMemory(
-                            &in_shm);
-
-                        aes_rel_calls++;
-
-                        if (returnOrigin)
-                            *returnOrigin =
-                                TEEC_ORIGIN_API;
-
-                        return rr;
-                    }
-
-                    op2.paramTypes =
-                        TEEC_PARAM_TYPES(
-                            TEEC_MEMREF_PARTIAL_INPUT,
-                            TEEC_MEMREF_PARTIAL_OUTPUT,
-                            TEEC_NONE,
-                            TEEC_NONE);
-
-                    op2.params[0].memref.parent =
-                        &in_shm;
-
-                    op2.params[0].memref.offset =
-                        in_off;
-
-                    op2.params[0].memref.size =
-                        chunk;
-
-                    op2.params[1].memref.parent =
-                        &out_shm;
-
-                    op2.params[1].memref.offset =
-                        out_off;
-
-                    op2.params[1].memref.size =
-                        chunk;
-
-                    r = TEEC_InvokeCommand(
-                            target,
-                            commandID,
-                            &op2,
-                            &origin);
-
-                    DBG_PRINT(
-                        "AES ZC WINDOW INVOKE: "
-                        "off=%zu len=%zu/%zu "
-                        "-> 0x%x (origin=%u)",
-                        offset,
-                        chunk,
-                        in_len,
-                        r,
-                        origin);
-
-                    aes_zc_calls_in++;
-                    aes_zc_calls_out++;
-
-                    TEEC_ReleaseSharedMemory(
-                            &out_shm);
-
-                    aes_rel_calls++;
-
-                    TEEC_ReleaseSharedMemory(
-                            &in_shm);
-
-                    aes_rel_calls++;
-                }
-
-                if (r != TEEC_SUCCESS) {
-                    if (returnOrigin)
-                        *returnOrigin = origin;
-
-                    return r;
-                }
-
-                offset += chunk;
-            }
-
-            p->output_size =
-                (unsigned long)in_len;
-
-            if (returnOrigin)
-                *returnOrigin = origin;
-
-            return TEEC_SUCCESS;
-        }
-
-        /*
-         * ========================================================
-         * TEMP / ZX
-         * ========================================================
-         */
-        size_t offset = 0;
-
-        while (offset < in_len) {
-
-            size_t chunk =
-                in_len - offset;
-
-            if (chunk > max_chunk)
-                chunk = max_chunk;
-
-            memset(&op2, 0, sizeof(op2));
-
-            op2.paramTypes =
-                TEEC_PARAM_TYPES(
-                    TEEC_MEMREF_TEMP_INPUT,
-                    TEEC_MEMREF_TEMP_OUTPUT,
-                    TEEC_NONE,
-                    TEEC_NONE);
-
-            op2.params[0].tmpref.buffer =
-                in_buf + offset;
-
-            op2.params[0].tmpref.size =
-                chunk;
-
-            op2.params[1].tmpref.buffer =
-                out_buf + offset;
-
-            op2.params[1].tmpref.size =
-                chunk;
-
-            r = TEEC_InvokeCommand(
-                    target,
-                    commandID,
-                    &op2,
-                    &origin);
-
-            DBG_PRINT(
-                "AES TMP CHUNK: "
-                "off=%zu len=%zu/%zu "
-                "-> 0x%x (origin=%u)",
-                offset,
-                chunk,
-                in_len,
-                r,
-                origin);
-
-            aes_tmp_calls_in++;
-            aes_tmp_calls_out++;
-
-            if (r != TEEC_SUCCESS) {
-                if (returnOrigin)
-                    *returnOrigin = origin;
-
-                return r;
-            }
-
-            offset += chunk;
-        }
-
-        p->output_size =
-            (unsigned long)in_len;
-
-        if (returnOrigin)
-            *returnOrigin = origin;
-
-        return TEEC_SUCCESS;
     }
+
+    if (!in_buf || !out_buf || in_len == 0) {
+        DBG_PRINT("AES DOCIPHER: invalid in/out");
+        if (returnOrigin) *returnOrigin = TEEC_ORIGIN_API;
+        return TEEC_ERROR_BAD_PARAMETERS;
+    }
+
+    /* CBC NOPAD requires block alignment */
+    if ((in_len & 0x0F) != 0 || out_len < in_len) {
+        DBG_PRINT("AES DOCIPHER: bad lengths (in=%zu out=%zu)", in_len, out_len);
+        if (returnOrigin) *returnOrigin = TEEC_ORIGIN_API;
+        return TEEC_ERROR_BAD_PARAMETERS;
+    }
+
+   /* Decide path */
+if (use_zerocopy(in_len)) {
+    size_t in_off = 0, out_off = 0;
+
+    /* Ensure page-based SHM for input */
+    r = ensure_pg_shm_multi(&real_ctx,
+                            aes_in_pg, AES_PG_CACHE_N, &aes_in_rr,
+                            in_buf, in_len,
+                            TEEC_MEM_INPUT,
+                            &in_off);
+    if (r != TEEC_SUCCESS)
+        goto aes_docipher_temp_path;
+
+    /* Ensure page-based SHM for output */
+    r = ensure_pg_shm_multi(&real_ctx,
+                            aes_out_pg, AES_PG_CACHE_N, &aes_out_rr,
+                            out_buf, in_len,
+                            TEEC_MEM_OUTPUT,
+                            &out_off);
+    if (r != TEEC_SUCCESS)
+        goto aes_docipher_temp_path;
+
+    /* Find matching parents by page base */
+    uintptr_t in_base  = align_down_u((uintptr_t)in_buf,  titan_pagesz());
+    uintptr_t out_base = align_down_u((uintptr_t)out_buf, titan_pagesz());
+
+    TEEC_SharedMemory *in_parent  = NULL;
+    TEEC_SharedMemory *out_parent = NULL;
+
+    for (unsigned i = 0; i < AES_PG_CACHE_N; i++) {
+        if (aes_in_pg[i].valid && aes_in_pg[i].base == (void *)in_base)
+            in_parent = &aes_in_pg[i].shm;
+        if (aes_out_pg[i].valid && aes_out_pg[i].base == (void *)out_base)
+            out_parent = &aes_out_pg[i].shm;
+    }
+
+    if (!in_parent || !out_parent)
+        goto aes_docipher_temp_path;
+
+    /* Build OP-TEE operation */
+    memset(&op2, 0, sizeof(op2));
+    op2.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT,
+                                      TEEC_MEMREF_PARTIAL_OUTPUT,
+                                      TEEC_NONE,
+                                      TEEC_NONE);
+
+    op2.params[0].memref.parent = in_parent;
+    op2.params[0].memref.offset = in_off;
+    op2.params[0].memref.size   = in_len;
+
+    op2.params[1].memref.parent = out_parent;
+    op2.params[1].memref.offset = out_off;
+    op2.params[1].memref.size   = in_len;   /* CBC produces same length */
+
+    TEEC_Result rr = TEEC_InvokeCommand(target, commandID, &op2, &origin);
+
+    DBG_PRINT("AES DOCIPHER (ZC-PG): in=%p off=%zu len=%zu out=%p off=%zu -> 0x%x (origin=%u)",
+              in_buf, in_off, in_len,
+              out_buf, out_off,
+              rr, origin);
+
+    if (rr == TEEC_SUCCESS) {
+        p->output_size = (unsigned long)op2.params[1].memref.size;
+    }
+
+    aes_zc_calls_in++;
+    aes_zc_calls_out++;
+
+    if (returnOrigin)
+        *returnOrigin = origin;
+
+    return rr;
+}
+
+
+aes_docipher_temp_path:
+    /* TEMP fallback path */
+    memset(&op2, 0, sizeof(op2));
+    op2.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+                                      TEEC_MEMREF_TEMP_OUTPUT,
+                                      TEEC_NONE, TEEC_NONE);
+    op2.params[0].tmpref.buffer = in_buf;
+    op2.params[0].tmpref.size   = in_len;
+    op2.params[1].tmpref.buffer = out_buf;
+    op2.params[1].tmpref.size   = out_len;
+
+    r = TEEC_InvokeCommand(target, commandID, &op2, &origin);
+
+    DBG_PRINT("AES DOCIPHER (TEMP): in=%p len=%zu out=%p -> 0x%x (origin=%u)",
+              in_buf, in_len, out_buf, r, origin);
+
+    if (r == TEEC_SUCCESS)
+        p->output_size = (unsigned long)op2.params[1].tmpref.size;
+
+    aes_tmp_calls_in++;
+    aes_tmp_calls_out++;
+
+    if (returnOrigin) *returnOrigin = origin;
+    return r;
+}
 
 
    if (commandID == TITANSSL_CMD_AES_CLEANUP) {
