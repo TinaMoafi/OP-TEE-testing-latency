@@ -1,0 +1,9 @@
+gcc -Wall -fPIC -g -I/home/fvolante/openssl-1.1.1l/include -I/usr/include -I. -c engine.c -o engine.o
+gcc -Wall -fPIC -g -I/home/fvolante/openssl-1.1.1l/include -I/usr/include/optee -I/usr/include -DTITANSSL_WRAPPER_INTERNAL -c tee_client_api.c -o tee_client_api.o
+tee_client_api.c:96:20: error: redefinition of 'use_zerocopy'
+   96 | static inline bool use_zerocopy(size_t n) {
+      |                    ^~~~~~~~~~~~
+tee_client_api.c:54:20: note: previous definition of 'use_zerocopy' with type '_Bool(size_t)' {aka '_Bool(unsigned int)'}
+   54 | static inline bool use_zerocopy(size_t n) { return n >= zc_threshold_runtime; }
+      |                    ^~~~~~~~~~~~
+make: *** [Makefile:37: tee_client_api.o] Error 1
